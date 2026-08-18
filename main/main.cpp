@@ -1,580 +1,543 @@
-#include <cstdint>
-#include <stdio.h>
-#include <stdlib.h>
+// Pinball Wizard 2026
+// Lets gooo!!!!!
+
+#include "LGFX_Config.hpp"
+#include "esp_log.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-#include "LGFX_Config.hpp"
-#include "esp_random.h"
-
+#include "led_strip.h"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "P4_APP";
 LGFX_ST7701_P4 lcd;
 
+// IO PINS
+// OLD RGB LED
+#define LED_STRIP_GPIO GPIO_NUM_29
+#define LED_STRIP_LED_COUNT 50
 
-/// c64 hilfsfunktion für text infos
-void showC64Intro(const char* title, const char* info) {
-    // C64 Farben: Blau (#4040E0), Hellblau (#A0A0FF)
-    uint32_t c64_blue = lgfx::color888(64, 64, 224);
-    uint32_t c64_light = lgfx::color888(160, 160, 255);
 
-    lcd.sprite.fillSprite(c64_blue);
-    lcd.sprite.setTextColor(c64_light);
-    lcd.sprite.setTextSize(2);
-    lcd.sprite.setFont(&fonts::FreeSansBold9pt7b); // Kompakterer Font für 10 Zeilen
-    
-    lcd.sprite.setCursor(20, 100);
-    lcd.sprite.println("**** COMMODORE ****");
-    lcd.sprite.setCursor(20, 130);
-    lcd.sprite.println("*** 64 BASIC V2 ***");
-    lcd.sprite.setCursor(2, 200);
-    lcd.sprite.print("DEMO: "); 
-    lcd.sprite.println(title);
-    lcd.sprite.println("");
-    
-    // Die Info-Texte (maximal 10 Zeilen/Wörter)
-    lcd.sprite.setCursor(2, 300);
-    lcd.sprite.println(info);
-    
-    lcd.sprite.println("");
-    lcd.sprite.println("LOADING...");
-    lcd.sprite.print("_"); // Der blinkende Cursor-Ersatz
 
-    lcd.pushCache();
-    vTaskDelay(pdMS_TO_TICKS(2000)); // 1 Sekunde Anzeigezeit
+//   Physical Keys
+#define        ioPinSideLeft    50     // hardware pullup 10k onboard soldered on the PCB, because its snappier then the inbuild 45k ohm, and less emf radiated
+#define        ioPinSideRight   49     // hardware pullup 10k onboard soldered on the PCB
+#define        ioPinFrontLeft   35     // hardware pullup 10k onboard soldered on the PCB
+#define        ioPinFrontRight  34     // hardware pullup 10k onboard soldered on the PCB
+#define        ioPinSideXLeft   32     // hardware pullup 10k onboard soldered on the PCB
+#define        ioPinSideXRight  28     // hardware pullup 10k onboard soldered on the PCB  ACHTUNG ÄNDERN AUF >31 wegen register GPIO Matrix
+
+#define        ioPinLedStrip    29     // 200 ohm resistor in series to the LED's data-in, VCC 5V from 5V Standby
+
+int16_t PixelReadyToSend      =   0 ; // flag, damit am ande des main loops fest steht ob ein led frame gesendet werden kann oder nicht
+// NEW RGB LED SEGMENTS
+uint8_t LedSegTopFlipperLeft[10]      = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};            // intern left 1 to right 10
+uint8_t LedSegTopFlipperRight[10]     = {11, 12, 13, 14, 15, 16, 17, 18, 19, 20};   // intern right to left
+uint8_t LedSegFrontLeft               =  21;    // Only 1 Led, no segment  
+uint8_t LedSegFrontRight              =  22;    // Only 1 Led, no segment
+uint8_t LedSegFlipperBlockLeft[4]     = {23,    // Qanba 30mm Primary Flipper Switch
+                                         24,    // Qanba 24mm Secondary Flipper Switch
+                                         25,    // BG Light 1 Left
+                                         26};   // BG Light 2 Left
+uint8_t LedSegFlipperBlockRight[4]    = {27,    // Qanba 30mm Primary Flipper Switch
+                                         28,    // Qanba 24mm Secondary Flipper Switch
+                                         29,    // BG Light 1 Right
+                                         30};   // BG Light 2 Right
+uint8_t LedSegBottomLeft[1]           = {31};   // Only 1 Led, actual no segment, in future maybe more leds
+uint8_t LedSegBottomRight[1]          = {32};   // Only 1 Led, actual no segment, in future maybe more leds
+const uint16_t PixelCount             =  32;    // Summary of all leds, only for statistiks and the diagnostik tool
+
+
+#define CANVAS_WIDTH  480
+#define CANVAS_HEIGHT 800
+
+uint8_t UIinterval       = 20;          // sets every x ms screenrefresh (20ms = 50 Hz). only touches things will trigger changes in the ui
+uint8_t menuNumberActive = 0;           // Active Menu, 0 = Main Menu, 1 = Options Menu, 2 = Game Menu, etc.
+uint8_t menuDrawOnce     = 1;           // Signalisiert das ein Menu einmal komplett gerendert werden muss. (wir setzen es direkt auf high, damit gleich menu0 bereit gemacht wird)
+                                        // wenn >0kann sie auch als counter für die start animation genommen werden 
+                                        // abhängig vom menu, danach wird sie auf 0 gesetzt um weiterzuarbeiten.
+                                        // touch sollte schon während der animation abgefragt werden.
+int     sleepTimer  =             15;   // 10-300 Minuten nach letztem tastendruck deep sleep shutdown. display einbrennen verhindern. akku schonen. später über filesystem oder in rtc speichern
+int     ledTimeOff  =             60;   // 60 Sekunden = 1 minuten bis die leds zum stromsparen ausgehen. jede taste/touch reaktiviert timer
+uint8_t menuFallback=              4;   // (einstellbar in settings menu) fallback menu, next variable defines timeout time
+int     menuTimeOutToFallback =   20;   // (einstellbar in settings menu) setzt nach X sekunden menuNumberActive = menuFallback, draw once is set to high 
+
+// Y-Koordinaten der Menu0 Sub-Sprites (fuer Rendering & Touch-Abfrage)
+const uint16_t menu0_y_coords[9]     = {180, 255, 330, 405, 480, 555, 630, 705, 780};
+const uint16_t menu0_sub_heights[9]  = { 75,  75,  75,  75,  75,  75,  75,  75,  20};
+
+// Start-X-Koordinaten fuer die Slide-In Animation (TopBanner & Sub-Sprites von rechts versetzt)
+const int16_t  menu0_top_banner_start_x = 480;
+const int16_t  menu0_start_x[9]         = { 480 + 80, 480 + 160, 480 + 240, 480 + 320, 480 + 400, 480 + 480, 480 + 560, 480 + 640, 480 + 720 };
+#define MENU0_ANIM_FRAMES 100 // 100 Frames bei 20ms Intervall (50 Hz) = 2000ms Gesamtdauer
+
+// Vorausberechnete LUT-Tabelle (Look-Up Table): Spart jede Frame-Umrechnung zur Laufzeit komplett ein!
+static int16_t menu0_anim_lut[MENU0_ANIM_FRAMES][10];
+
+static void init_menu0_animation_lut(void) {
+  for (int f = 0; f < MENU0_ANIM_FRAMES; f++) {
+    float progress = (float)f / (float)(MENU0_ANIM_FRAMES - 1);
+
+    // TopBanner X-Koordinate
+    int16_t bx = (int16_t)(menu0_top_banner_start_x * (1.0f - progress));
+    menu0_anim_lut[f][0] = (bx < 0) ? 0 : bx;
+
+    // Sub-Sprites 0..8 X-Koordinaten
+    for (int i = 0; i < 9; i++) {
+      int16_t sx = (int16_t)(menu0_start_x[i] * (1.0f - progress));
+      menu0_anim_lut[f][1 + i] = (sx < 0) ? 0 : sx;
+    }
+  }
+}
+
+// Persistent Sprites & Offscreen Canvas im PSRAM (bleiben im Speicher fuer schnellen Zugriff)
+static lgfx::LGFX_Sprite bg_sprite;
+static lgfx::LGFX_Sprite canvas;
+static lgfx::LGFX_Sprite top_banner_sprites[4];
+static lgfx::LGFX_Sprite menu0_sub_sprites[9];
+static bool menu0_ram_loaded = false;
+
+#include <errno.h>
+
+// Hilfsfunktion: Lädt eine JPG-Datei aus LittleFS direkt in ein Sprite (systemschonend & sicher)
+static bool load_jpg_file_to_sprite(lgfx::LGFX_Sprite &sprite, const char *path) {
+  // 1. Datei aus dem LittleFS öffnen
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    ESP_LOGE(TAG, "fopen fehlgeschlagen fuer: %s (Errno %d: %s)", path, errno, strerror(errno));
+    return false;
+  }
+
+  // 2. Exacte Dateigröße der JPG-Datei ermitteln
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+
+  if (sz <= 0) {
+    ESP_LOGE(TAG, "Datei ist leer: %s (size=%ld)", path, sz);
+    fclose(f);
+    return false;
+  }
+
+  // 3. Temporären Lesepuffer im PSRAM/RAM für das JPG anfordern
+  uint8_t *buf = (uint8_t *)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) {
+    buf = (uint8_t *)malloc(sz);
+  }
+
+  if (!buf) {
+    ESP_LOGE(TAG, "Speicherallokierung für JPG-Puffer fehlgeschlagen: %ld Bytes", sz);
+    fclose(f);
+    return false;
+  }
+
+  // 4. JPG-Datei vollständig in den RAM einlesen & Datei sofort schließen
+  size_t read_bytes = fread(buf, 1, sz, f);
+  fclose(f);
+
+  if (read_bytes != (size_t)sz) {
+    ESP_LOGE(TAG, "fread unvollstaendig: %d von %ld Bytes gelesen", (int)read_bytes, sz);
+    free(buf);
+    return false;
+  }
+
+  // 5. JPG aus dem Speicherpuffer in das Sprite decodieren & Lesepuffer sofort freigeben
+  bool ok = sprite.drawJpg(buf, read_bytes, 0, 0);
+  free(buf);
+
+  if (!ok) {
+    ESP_LOGE(TAG, "sprite.drawJpg Decoder-Fehler fuer: %s (%ld Bytes)", path, sz);
+  } else {
+    ESP_LOGI(TAG, "Erfolgreich geladen: %s (%ld Bytes)", path, sz);
+  }
+
+  return ok;
+}
+
+// Ultraschneller Scanline-Compositor: Zeichnet ein 24-bit RGB888 Sprite direkt mit Hardware-Memcpy (ohne Overhead)
+static inline void blit_sprite_fast(uint8_t *dst_canvas, const uint8_t *src_sprite, 
+                                   int16_t x, int16_t y, int16_t sprite_w, int16_t sprite_h) {
+  if (!dst_canvas || !src_sprite) return;
+  if (x >= CANVAS_WIDTH || (x + sprite_w) <= 0 || y >= CANVAS_HEIGHT || (y + sprite_h) <= 0) {
+    return; // Komplett ausserhalb des sichtbaren Bereichs
+  }
+
+  int16_t src_start_x = 0;
+  int16_t dst_start_x = x;
+  int16_t copy_w      = sprite_w;
+
+  if (dst_start_x < 0) {
+    src_start_x = -dst_start_x;
+    copy_w     += dst_start_x;
+    dst_start_x = 0;
+  }
+  if (dst_start_x + copy_w > CANVAS_WIDTH) {
+    copy_w = CANVAS_WIDTH - dst_start_x;
+  }
+  if (copy_w <= 0) return;
+
+  size_t copy_bytes = (size_t)copy_w * 3;
+  size_t src_pitch  = (size_t)sprite_w * 3;
+  size_t dst_pitch  = (size_t)CANVAS_WIDTH * 3;
+
+  for (int16_t row = 0; row < sprite_h; row++) {
+    int16_t dst_y = y + row;
+    if (dst_y < 0 || dst_y >= CANVAS_HEIGHT) continue;
+
+    const uint8_t *s = src_sprite + (row * src_pitch) + (src_start_x * 3);
+    uint8_t       *d = dst_canvas + (dst_y * dst_pitch) + (dst_start_x * 3);
+    memcpy(d, s, copy_bytes);
+  }
+}
+
+static void load_menu0_sprites_to_ram(void) {
+  if (menu0_ram_loaded) return;
+
+  ESP_LOGI(TAG, "Lade Basis-Menu Sprites in den RAM (PSRAM)...");
+  bool all_ok = true;
+
+  // LUT-Tabelle fuer Animation einmalig initialisieren
+  init_menu0_animation_lut();
+
+  // Offscreen Canvas (480x800) im PSRAM initialisieren (Double-Buffering)
+  canvas.setPsram(true);
+  canvas.setColorDepth(24);
+  canvas.createSprite(CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  // 4 TopBanner Sprites laden (480x180)
+  for (int i = 0; i < 4; i++) {
+    top_banner_sprites[i].setPsram(true);
+    top_banner_sprites[i].setColorDepth(24);
+    top_banner_sprites[i].createSprite(480, 180);
+    char path[64];
+    snprintf(path, sizeof(path), "/littlefs/TopBanner/top_menu_banner-%d-480.jpg", i + 1);
+    if (!load_jpg_file_to_sprite(top_banner_sprites[i], path)) {
+      all_ok = false;
+    }
+  }
+
+  // 9 Sub-Sprites laden
+  for (int i = 0; i < 9; i++) {
+    menu0_sub_sprites[i].setPsram(true);
+    menu0_sub_sprites[i].setColorDepth(24);
+    menu0_sub_sprites[i].createSprite(480, menu0_sub_heights[i]);
+    char path[64];
+    snprintf(path, sizeof(path), "/littlefs/Sprites/menu0-sub%d.jpg", i);
+    if (!load_jpg_file_to_sprite(menu0_sub_sprites[i], path)) {
+      all_ok = false;
+    }
+  }
+
+  if (all_ok) {
+    menu0_ram_loaded = true;
+    ESP_LOGI(TAG, "Alle Basis-Menu Sprites erfolgreich im RAM geladen.");
+  } else {
+    ESP_LOGE(TAG, "FEHLER beim Laden: Mindestens ein Sprite konnte nicht decodiert werden!");
+  }
 }
 
 
 
 
-extern "C" void app_main(void)
-{
-    // Hier muss der Aufruf rein!
-    if (!lcd.initFS()) { 
-        ESP_LOGE(TAG, "LittleFS konnte nicht initialisiert werden!");
-    } else {
-        ESP_LOGI(TAG, "LittleFS erfolgreich gemountet.");
-    }
+
+
+
+
+
+bool _touchDetected            = false;  
+uint32_t UIintervalTimerFlag   = 0;
+int _lastTouchX                = 0;
+int _lastTouchY                = 0;
+int _cachedTouchX              = -1;
+int _cachedTouchY              = -1;
+uint16_t processTouchIntervalSpeed    =  40; // touch scan speed user operates in menus via touch. 10ms-199ms timetrap für gute reactivität 10-40ms im NICHT throttle mode,
+uint16_t processTouchIntervalThrottle = 500; // touch scan speed in throttle mode aka user is gaming no use of display
+uint16_t processTouchNextKeyDelay     = 300; // repeat on button pressed+hold. geschwindigkeit zwischen den touch tasten ausgaben
+uint32_t touchThrottleTimeout         =4000; // nach zeit x den highspeed mode scan mode verlassen und volle performance zurück in den main loop
+uint16_t touchHysteresis              =   1; // Toleranz in Pixeln ([1-5] falls der Finger zittert. lustiges feature. wenn man den button reibt, gehts schneller (touchHytseresisKeyRepeatTime))
+uint16_t touchHytseresisKeyRepeatTime =  80; // spielt nur im speed mode eine rolle, damit nicht zu viele touches/sec auf die moving finger methode raus gefeuert werden. es soll schneller, aber nicht max schnell sein.
+
+uint32_t lastTouchActivityTimerFlag   =   0; // Speichert den Zeitpunkt der letzten Berührung
+uint32_t processTouchNextKeyTimeFlag  =   0; 
+uint32_t processTouchTimeFlag         =   0;
+uint32_t timeTrapOneSecond            =   0;
+int processTouchRepeatBlockerPerMenu  =   0; // kann auch mit initialisiert werden.
     
-    if (!lcd.initBus()) {
-        ESP_LOGE(TAG, "Display Init fehlgeschlagen!");
-        return;
+
+int8_t emulationMode                  =   1; // HID profiles 1 = bt Quest, 2 = btPC, 3 = bt Android , 4 = bt Iphone, 5 = bt Switch , usb-hid (per funktion und if/case rutsche) 
+int                            dbglvl =   5; // Globale Debug-Variable over Serial0 UART, zentral in main.cpp
+                                             // 1 only benchmark on screen, >1 to 10 goes to serial // später
+                                             // über filesystem oder in rtc speichern
+int dbglvlOSD                         =   5; // only a small blue translucent sprite with minimal info + benchmark
+int dbglvlOSDoldState = dbglvlOSD;           // State machine for dbglvlOSD
+
+
+
+
+
+
+static led_strip_handle_t led_strip = nullptr;
+static uint16_t g_rainbow_hue = 0;
+
+static void init_led_strip(void) {
+  ESP_LOGI(TAG, "Initialisiere WS28xx LED-Strip an GPIO %d (%d LEDs)...", 
+           (int)LED_STRIP_GPIO, LED_STRIP_LED_COUNT);
+  led_strip_config_t strip_config = {};
+  strip_config.strip_gpio_num = LED_STRIP_GPIO;
+  strip_config.max_leds = LED_STRIP_LED_COUNT;
+  strip_config.led_pixel_format = LED_PIXEL_FORMAT_GRB;
+  strip_config.led_model = LED_MODEL_WS2812;
+  strip_config.flags.invert_out = false;
+
+  led_strip_rmt_config_t rmt_config = {};
+  rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
+  rmt_config.resolution_hz = 10 * 1000 * 1000; // 10MHz
+  rmt_config.mem_block_symbols = 64;
+  rmt_config.flags.with_dma = false;
+
+  esp_err_t err =
+      led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip);
+  if (err == ESP_OK) {
+    led_strip_clear(led_strip);
+    ESP_LOGI(TAG, "LED-Strip erfolgreich initialisiert.");
+  } else {
+    ESP_LOGE(TAG, "LED-Strip Initialisierung fehlgeschlagen! Error: %s",
+             esp_err_to_name(err));
+  }
+}
+
+// Hilfsfunktion: HSV zu RGB Konvertierung
+static void hsv_to_rgb(uint32_t h, uint32_t s, uint32_t v, uint32_t *r,
+                       uint32_t *g, uint32_t *b) {
+  h %= 360;
+  uint32_t rgb_max = v * 255 / 255;
+  uint32_t rgb_min = rgb_max * (255 - s) / 255;
+  uint32_t i = h / 60;
+  uint32_t diff = h % 60;
+  uint32_t rgb_adj = (rgb_max - rgb_min) * diff / 60;
+
+  switch (i) {
+  case 0:
+    *r = rgb_max;
+    *g = rgb_min + rgb_adj;
+    *b = rgb_min;
+    break;
+  case 1:
+    *r = rgb_max - rgb_adj;
+    *g = rgb_max;
+    *b = rgb_min;
+    break;
+  case 2:
+    *r = rgb_min;
+    *g = rgb_max;
+    *b = rgb_min + rgb_adj;
+    break;
+  case 3:
+    *r = rgb_min;
+    *g = rgb_max - rgb_adj;
+    *b = rgb_max;
+    break;
+  case 4:
+    *r = rgb_min + rgb_adj;
+    *g = rgb_min;
+    *b = rgb_max;
+    break;
+  default:
+    *r = rgb_max;
+    *g = rgb_min;
+    *b = rgb_max - rgb_adj;
+    break;
+  }
+}
+
+// Einen Frame des Regenbogens fortschreiten lassen
+static void step_rainbow(void) {
+  if (!led_strip)
+    return;
+  for (int i = 0; i < LED_STRIP_LED_COUNT; i++) {
+    uint32_t hue = (g_rainbow_hue + (i * 360 / LED_STRIP_LED_COUNT)) % 360;
+    uint32_t r = 0, g = 0, b = 0;
+    hsv_to_rgb(hue, 255, 100, &r, &g, &b);
+    led_strip_set_pixel(led_strip, i, r, g, b);
+  }
+  led_strip_refresh(led_strip);
+  g_rainbow_hue = (g_rainbow_hue + 3) % 360;
+}
+
+// Regenbogeneffekt fuer eine bestimmte Dauer (in ms)
+void run_rainbow(uint32_t duration_ms) {
+  TickType_t start_tick = xTaskGetTickCount();
+  TickType_t duration_ticks = pdMS_TO_TICKS(duration_ms);
+
+  while ((xTaskGetTickCount() - start_tick) < duration_ticks) {
+    step_rainbow();
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// Block-Definitionen fuer Fisher-Yates Effect
+#define BLOCK_SIZE 8
+#define CANVAS_WIDTH 480
+#define CANVAS_HEIGHT 800
+#define GRID_COLS (CANVAS_WIDTH / BLOCK_SIZE)  // 60 Spalten
+#define GRID_ROWS (CANVAS_HEIGHT / BLOCK_SIZE) // 100 Zeilen
+#define TOTAL_BLOCKS (GRID_COLS * GRID_ROWS)   // 6000 Bloecke
+
+static void init_and_shuffle_blocks(uint16_t *indices, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    indices[i] = i;
+  }
+  // Fisher-Yates Shuffle
+  for (size_t i = count - 1; i > 0; i--) {
+    size_t j = esp_random() % (i + 1);
+    std::swap(indices[i], indices[j]);
+  }
+}
+
+extern "C" void app_main(void) {
+  // LED Strip auf GPIO 29 initialisieren
+  init_led_strip();
+
+  if (!lcd.initFS()) {
+    ESP_LOGE(TAG, "LittleFS konnte nicht initialisiert werden!");
+  } else {
+    ESP_LOGI(TAG, "LittleFS erfolgreich gemountet.");
+  }
+
+  if (!lcd.initBus()) {
+    ESP_LOGE(TAG, "Display Init fehlgeschlagen!");
+    return;
+  }
+
+  lcd.init();
+  lcd.setBrightness(200); // set display brightness
+                          // vTaskDelay(pdMS_TO_TICKS(500));
+
+  // 1. Display zum Start mit Schwarz leeren
+  lcd.sprite.fillSprite(0x000000);
+  lcd.pushCache();
+
+  // 2. Offscreen-Sprite fuer Hintergrundbild (PSRAM) & Shuffle-Array (Heap) allozieren
+  bg_sprite.setPsram(true);
+  bg_sprite.setColorDepth(24);
+  bg_sprite.createSprite(CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  uint16_t *block_indices = (uint16_t *)heap_caps_malloc(
+      TOTAL_BLOCKS * sizeof(uint16_t), MALLOC_CAP_8BIT);
+
+  if (!bg_sprite.getBuffer() || !block_indices) {
+    ESP_LOGE(TAG, "Speicherallokierung fuer Offscreen-Puffer/Block-Indices "
+                  "fehlgeschlagen!");
+    if (block_indices)
+      free(block_indices);
+    bg_sprite.deleteSprite();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    return;
+  }
+
+  ESP_LOGI(TAG, "Lade Bild PBWZ800x480.jpg in Offscreen-Puffer...");
+  bool ok = load_jpg_file_to_sprite(bg_sprite, "/littlefs/bg/PBWZ800x480.jpg");
+  if (!ok) {
+    ESP_LOGE(TAG, "Bild konnte nicht geladen werden!");
+    bg_sprite.fillSprite(0x0000FF); // Blau als Fallback
+    bg_sprite.setTextColor(0xFFFF);
+    bg_sprite.drawString("Bild-Fehler!", 10, 10);
+  }
+
+  // 3. Fisher-Yates Shuffle der 8x8 Bloecke
+  init_and_shuffle_blocks(block_indices, TOTAL_BLOCKS);
+
+  uint8_t *src_buf = (uint8_t *)bg_sprite.getBuffer();
+  uint8_t *dst_buf = (uint8_t *)lcd.sprite.getBuffer();
+
+  // 4. Geordneter Zufall (abgeschlossen in 3000ms: 20 Bloecke pro Frame bei
+  // 10ms Delay -> 300 Frames = 3.0s)
+  for (int i = 0; i < TOTAL_BLOCKS; i += 20) {
+    for (int b = 0; b < 20 && (i + b) < TOTAL_BLOCKS; b++) {
+      uint16_t idx = block_indices[i + b];
+      int bx = (idx % GRID_COLS) * BLOCK_SIZE;
+      int by = (idx / GRID_COLS) * BLOCK_SIZE;
+
+      for (int ry = 0; ry < BLOCK_SIZE; ry++) {
+        uint32_t offset = ((by + ry) * CANVAS_WIDTH + bx) * 3;
+        memcpy(&dst_buf[offset], &src_buf[offset], BLOCK_SIZE * 3);
+      }
     }
-    
-    lcd.init(); 
-    lcd.setBrightness(200);                    // set display brightness
-    vTaskDelay(pdMS_TO_TICKS(500));
 
-/// Einmaliges Setup Sprite 2 foreground debug window (global oder in app_main)  DEBUG OVERLAY
-lgfx::LGFX_Sprite overlay(&lcd.sprite); 
-overlay.setPsram(true); // Nutzt den 32MB Speicher des P4
-overlay.setColorDepth(24); // 24-Bit für konsistente Farben
-overlay.createSprite(380, 100); // Größe des Kastens
-overlay.setPivot(0, 0);
+    lcd.pushCache();
+    step_rainbow();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 
-/// einmalig zweiten frame buffer reservieren, um tearing also den realtime bildaufbau zu vermeiden.
-// In der main.cpp vor der Schleife:
-// 480 * 800 * 3 Bytes = 1.152.000 Bytes
-uint8_t* back_buffer = (uint8_t*)heap_caps_malloc(1152000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  ESP_LOGI(TAG, "Bild vollstaendig per Fisher-Yates aufgebaut.");
 
+  // 5. Shuffle-Array (Heap) freigeben (bg_sprite bleibt im PSRAM erhalten!)
+  free(block_indices);
 
+  // 6. 3 Sekunden Regenbogen anzeigen
+  run_rainbow(3000);
 
+  // end intro
 
+  // Basis-Menu Sprites im RAM bereitstellen (laden nur einmalig)
+  load_menu0_sprites_to_ram();
 
+  int banner_idx = esp_random() % 4;
+  int anim_frame = 0;
+  UIintervalTimerFlag = (uint32_t)(esp_timer_get_time() / 1000);
 
+  while (1) {
+    uint32_t current_time = (uint32_t)(esp_timer_get_time() / 1000);
 
+    // Timetrap fuer Bildschirmaufbau / Animation alle UIinterval (40ms)
+    if ((current_time - UIintervalTimerFlag) >= UIinterval) {
+      UIintervalTimerFlag = current_time;
 
-///main()
-    showC64Intro("ESP32-P4", "SINGLE CORE\ngfx tests\nwith LovyanGFX\nlovyanGFX");
-    showC64Intro("ESP32-P4", "with 2 cores\ntheoreticly\neverything\ncould run at\ndouble speed!");
-    ESP_LOGI(TAG, "Starte Animation mit jpg, kreisen, Rechtecken, Text und Sprite...");
-    // --- DEMO 1: MANDELBROT ---
-    showC64Intro("P4 DEMO", "JPG\n24BIT\nRGB888\nand text in\nSprite 2\nlovyanGFX");
-    while (1) {
-        
-        // --- TEIL 0: Bild von LittleFS laden ---
-        // Wir nutzen den Pfad "/littlefs/", da du ihn in initFS so definiert hast.
-        ESP_LOGI(TAG, "Lade Bild PBWZ800x480.jpg...");
-        
-        // drawJpgFile lädt direkt in das Sprite (unseren Canvas)
-        // Falls das Bild 800x480 ist, das Display aber 480x800, wird es oben links gezeichnet.
-        bool ok = lcd.sprite.drawJpgFile("/littlefs/PBWZ800x480.jpg", 0, 0);
-        
-        if (!ok) {
-            ESP_LOGE(TAG, "Bild konnte nicht geladen werden! Datei vorhanden?");
-            lcd.sprite.setTextColor(0xFFFF);
-            lcd.sprite.drawString("Bild-Fehler!", 10, 10);
+      if (anim_frame < MENU0_ANIM_FRAMES) {
+        uint8_t *canvas_buf = (uint8_t *)canvas.getBuffer();
+        const uint8_t *bg_buf = (const uint8_t *)bg_sprite.getBuffer();
+
+        // 1. Hintergrundbild in 1 Direct-Block in den Canvas kopieren (< 0.05ms)
+        memcpy(canvas_buf, bg_buf, CANVAS_WIDTH * CANVAS_HEIGHT * 3);
+
+        // 2. TopBanner mit vorausberechneter X-Koordinate aus LUT blitten (Zero-Math)
+        int16_t banner_cur_x = menu0_anim_lut[anim_frame][0];
+        blit_sprite_fast(canvas_buf, (const uint8_t *)top_banner_sprites[banner_idx].getBuffer(),
+                         banner_cur_x, 0, 480, 180);
+
+        // 3. Sub-Sprites mit vorausberechneten X-Koordinaten aus LUT blitten (Zero-Math)
+        for (int i = 0; i < 9; i++) {
+          int16_t cur_x = menu0_anim_lut[anim_frame][1 + i];
+          blit_sprite_fast(canvas_buf, (const uint8_t *)menu0_sub_sprites[i].getBuffer(),
+                           cur_x, menu0_y_coords[i], 480, menu0_sub_heights[i]);
         }
 
+        // 4. Fertigen Frame in einem Rutsch per DMA uebertragen (100% Tear-Free Double Buffer)
+        memcpy(lcd.framebuffer, canvas_buf, CANVAS_WIDTH * CANVAS_HEIGHT * 3);
         lcd.pushCache();
-        vTaskDelay(pdMS_TO_TICKS(3000));
 
-/// Zeichne einen Kasten, der mit dem Hintergrund "verschmilzt"
-    lcd.sprite.startWrite();
+        anim_frame++;
+      } else {
+        // Animation abgeschlossen: Alle Sprites stehen stabil auf x=0
+        // 2000ms Wartezeit am Ende der Animation
+        vTaskDelay(pdMS_TO_TICKS(2000));
 
-        // 128 steht hier für ca. 50% Transparenz (0-255)
-        // befülle zweites sprite  
-    overlay.fillSprite(lgfx::color888(10, 10, 200)); // Blau füllen
-        // overlay.fillRect(50, 400, 380, 100, lgfx::color888(0, 0, 255));
-        //overlay.pushSprite(&lcd.sprite, 50, 400, 40); // Mit Alpha 128 (50%) auf das Haupt-DSI-Sprite schieben
-    overlay.pushSprite(&lcd.sprite, 50, 300, 128);
-    lcd.pushCache();
-
-lcd.sprite.setTextColor(lgfx::color888(255, 255, 255));
-lcd.sprite.setTextSize(3); // Große Schrift
-lcd.sprite.drawString("SPRITE", 100, 330);
-lcd.sprite.endWrite();
-lcd.pushCache();
-vTaskDelay(pdMS_TO_TICKS(3000));
-
-showC64Intro("GEOMETRIC", "10000\nCircles\nand\nsquares\nlovyanGFX");
-        // --- TEIL 1: Zufällige Geometrie ---
-        lcd.sprite.startWrite();
-        for (int i = 0; i < 10000; i++) {
-            int x = rand() % 480;
-            int y = rand() % 800;
-            int w = (rand() % 100) + 2;
-            int h = (rand() % 100) + 2;
-            int r = (rand() % 50)  + 2;
-            uint32_t color = (uint32_t)rand()% 16777216;
-
-            if (i % 2 == 0) {
-                lcd.sprite.fillCircle(x, y, r, color);
-            } else {
-                lcd.sprite.fillRect(x, y, w, h, color);
-            }
-        }
-        lcd.sprite.endWrite();
+        // Bildschirm schwarz loeschen
+        lcd.sprite.fillSprite(0x000000);
         lcd.pushCache();
-        vTaskDelay(pdMS_TO_TICKS(1000));
 
-        // --- TEIL 2: Vier senkrechte Farbbalken (R, G, B, W) ---
-        // Breite pro Balken: 480 / 4 = 120 Pixel
-
-        lcd.sprite.startWrite();
-
-        // Wir nutzen kein Hex mehr, sondern die Funktion, die beim Text funktionierte
-        lcd.sprite.fillRect(0,   0, 120, 800, lgfx::color888(255, 0, 0));     // Rot
-        lcd.sprite.fillRect(120, 0, 120, 800, lgfx::color888(0, 255, 0));     // Grün
-        lcd.sprite.fillRect(240, 0, 120, 800, lgfx::color888(0, 0, 255));     // Blau
-        lcd.sprite.fillRect(360, 0, 120, 800, lgfx::color888(255, 255, 255)); // Weiß
-        
-        lcd.sprite.endWrite();
-        lcd.pushCache();
-        
-        ESP_LOGI(TAG, "Farbbalken gezeichnet.");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        lcd.sprite.startWrite();
-        lcd.sprite.fillSprite(0xFFFFFF);          // Hintergrund Weiß
-        
-        // Schrift-Setup
-        lcd.sprite.setTextSize(4); // Große Schrift
-        lcd.sprite.setFont(&fonts::FreeSansBold18pt7b); // Schöner großer Font
-        
-        // Test 1: Rot
-        lcd.sprite.setTextColor(lgfx::color888(255, 0, 0)); 
-        lcd.sprite.drawString("RED", 1, 100);
-        
-        // Test 2: Grün
-        lcd.sprite.setTextColor(lgfx::color888(0, 255, 0));
-        lcd.sprite.drawString("GREEN", 1, 200);
-        
-        // Test 3: Blau
-        lcd.sprite.setTextColor(lgfx::color888(0, 0, 255));
-        lcd.sprite.drawString("BLUE", 1, 300);
-        
-        // Test 4: Schwarz
-        lcd.sprite.setTextColor(lgfx::color888(0, 0, 0));
-        lcd.sprite.drawString("BLACK", 1, 400);
-
-        lcd.sprite.endWrite();
-        lcd.pushCache();
-        
-        ESP_LOGI(TAG, "Text-Test auf dem Schirm");
-        vTaskDelay(pdMS_TO_TICKS(1000)); // 1 Sekunde(n) warten
-
-// --- TEIL 4: Das "Gute Nacht" Apfelmännchen (Single Core) ---
-showC64Intro("FRACTAL", "realtime\ncalculating\nNO doublebuffer\ndirectly into\nframebuffer\n(DMA PSRAM)");
-for(uint8_t count = 0; count < 3; count++){
-        ESP_LOGI(TAG, "Rendere Fraktal...");
-        
-        // Zufallswerte für die Abwechslung
-        float zoom = 0.002f + ((float)(esp_random() % 100) / 20000.0f);
-        float moveX = ((float)(esp_random() % 2000) / 1000.0f) - 1.5f;
-        float moveY = ((float)(esp_random() % 2000) / 1000.0f) - 1.0f;
-        uint32_t colorSalt = esp_random();
-        
-        uint8_t* buf = (uint8_t*)lcd.framebuffer;
-        const int max_iter = 255; // Niedriger für mehr Speed im Single-Core
-
-        for (int y = 0; y < 800; y++) {
-            for (int x = 0; x < 480; x++) {
-                // Berechnung
-                float pr = (x - 240) * zoom + moveX;
-                float pi = (y - 400) * zoom + moveY;
-                float zr = 0, zi = 0;
-                int iter = 0;
-                
-                while (zr*zr + zi*zi < 4 && iter < max_iter) {
-                    float temp = zr*zr - zi*zi + pr;
-                    zi = 2*zr*zi + pi;
-                    zr = temp;
-                    iter++;
-                }
-
-                // Pixel direkt in den 24-Bit Buffer schreiben (RGB888)
-                int idx = (y * 480 + x) * 3;
-                if (iter == max_iter) {
-                    buf[idx] = 0; buf[idx+1] = 0; buf[idx+2] = 0; // Schwarz
-                } else {
-                    // Einfaches Farbschema mit Salt
-                    buf[idx]   = (iter * 5 + colorSalt) % 256;         // R
-                    buf[idx+1] = (iter * 8 + (colorSalt >> 8)) % 256;  // G
-                    buf[idx+2] = (iter * 11 + (colorSalt >> 16)) % 256; // B
-                }
-            }
-        }
-
-        lcd.pushCache(); // Wichtig, damit der P4 den Speicher leert
-        ESP_LOGI(TAG, "Fraktal fertig.");
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-vTaskDelay(pdMS_TO_TICKS(800));
-
-
-
-
-// --- TEIL 5: Die Quadrat-Matrix (Sierpinski Engine) ---
-showC64Intro("Sierpinski", "realtime fractal\ncalculating\nNO doublebuffer\ndirect into fb");
-for(uint8_t count = 0; count < 5; count++){
-ESP_LOGI(TAG, "Starte Lineare Fraktal-Engine...");
-
-uint8_t* buf = (uint8_t*)lcd.framebuffer;
-uint32_t salt = esp_random();
-
-// Helfer-Funktion zum Zeichnen eines 24-Bit Pixels (Direkt im RAM)
-auto drawPixel24 = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
-    if (x >= 0 && x < 480 && y >= 0 && y < 800) {
-        int idx = (y * 480 + x) * 3;
-        buf[idx] = r; buf[idx+1] = g; buf[idx+2] = b;
-    }
-};
-
-// Helfer-Funktion für ein gefülltes Rechteck (Direkt im RAM)
-auto fillRect24 = [&](int x, int y, int w, int h, uint32_t color) {
-    uint8_t r = (color >> 16) & 0xFF;
-    uint8_t g = (color >> 8) & 0xFF;
-    uint8_t b = color & 0xFF;
-    for (int i = y; i < y + h; i++) {
-        for (int j = x; j < x + w; j++) {
-            drawPixel24(j, i, r, g, b);
-        }
-    }
-};
-
-// Die rekursive Engine
-std::function<void(int, int, int, int)> drawCarpet = 
-    [&](int x, int y, int size, int depth) {
-    if (depth == 0) return;
-
-    int newSize = size / 3;
-    
-    // Das mittlere Quadrat ausschneiden/färben
-    // Wir nutzen das Salt für neon-artige Farben
-    uint32_t color = ((salt ^ (depth * 0x123456)) & 0xFFFFFF);
-    fillRect24(x + newSize, y + newSize, newSize, newSize, color);
-
-    // Rekursion für die 8 umliegenden Quadrate
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            if (i == 1 && j == 1) continue; // Mitte überspringen
-            drawCarpet(x + i * newSize, y + j * newSize, newSize, depth - 1);
-        }
-    }
-};
-
-// Screen leeren
-memset(buf, 0, 480 * 800 * 3);
-
-// Starte das Fraktal (zentriert auf dem 480x800 Schirm)
-int carpetSize = 450; 
-int startX = (480 - carpetSize) / 2;
-int startY = (800 - carpetSize) / 2;
-int maxDepth = 4 + (esp_random() % 2); // Variierende Tiefe 4-5
-
-drawCarpet(startX, startY, carpetSize, maxDepth);
-
-lcd.pushCache();
-ESP_LOGI(TAG, "Sierpinski-Teppich fertig gerendert.");
-vTaskDelay(pdMS_TO_TICKS(1000));
-}
-
-/// sierpinski animation NOT BUFFERED. Directly write into DMA PSRAM frame buffer. shows tearing. 
-showC64Intro("Sierpinski", "realtime fractal\nNO doublebuffer\ndirekt into\n dma framebuffer");
-// --- TEIL 6: Die Sierpinski-Loop-Engine (Direktzugriff) ---
-ESP_LOGI(TAG, "Starte Sierpinski-Loop...");
-
-uint8_t* buf = (uint8_t*)lcd.framebuffer;
-uint8_t r_base = 0, g_base = 255, b_base = 200; // Dein Neon-Cyan
-
-for (int frame = 0; frame < 100; frame=frame +4) {
-    // 1. Framebuffer leeren
-    memset(buf, 0, 1152000); 
-
-    // 2. Zoom berechnen
-    float zoom = powf(3.0f, (float)frame / 300.0f);
-    float currentSize = 480.0f * zoom;
-    float startX = 240.0f - (currentSize / 2.0f);
-    float startY = 400.0f - (currentSize / 2.0f);
-
-    // 3. Rekursive Zeichen-Funktion (direkt integriert)
-    std::function<void(float, float, float, int)> drawLoop = 
-        [&](float x, float y, float size, int depth) {
-        if (depth == 0 || size < 1.0f) return;
-
-        float newSize = size / 3.0f;
-        
-        // Sichtbarkeits-Check (Clipping)
-        if (x + size > 0 && x < 480 && y + size > 0 && y < 800) {
-            
-            // --- ERSATZ FÜR fastRect: Direktes Füllen des Speichers ---
-            int rx = (int)(x + newSize);
-            int ry = (int)(y + newSize);
-            int rw = (int)newSize;
-            int rh = (int)newSize;
-            
-            uint8_t r = r_base >> (6 - depth);
-            uint8_t g = g_base >> (6 - depth);
-            uint8_t b = b_base >> (6 - depth);
-
-            for (int i = ry; i < ry + rh; i++) {
-                if (i < 0 || i >= 800) continue;
-                int rowOffset = i * 480 * 3;
-                for (int j = rx; j < rx + rw; j++) {
-                    if (j < 0 || j >= 480) continue;
-                    int idx = rowOffset + (j * 3);
-                    buf[idx] = r;     // R
-                    buf[idx + 1] = g; // G
-                    buf[idx + 2] = b; // B
-                }
-            }
-            // -------------------------------------------------------
-
-            for (int i = 0; i < 3; i++) {
-                for (int j = 0; j < 3; j++) {
-                    if (i == 1 && j == 1) continue; 
-                    drawLoop(x + i * newSize, y + j * newSize, newSize, depth - 1);
-                }
-            }
-        }
-    };
-
-    drawLoop(startX, startY, currentSize, 6);
-
-    // 4. Cache-Sync und MIPI-Update
-    lcd.pushCache();
-    vTaskDelay(pdMS_TO_TICKS(16)); // ~60 FPS Ziel
-}
-
-/// double buffer test
-// --- TEIL 7: Sierpinski-Loop mit Double-Buffering ---
-showC64Intro("Sierpinski", "realtime fractal\nWITH\ndoublebuffer\n");
-ESP_LOGI(TAG, "Starte Jitter-freie Animation...");
-
-uint8_t* display_fb = (uint8_t*)lcd.framebuffer;
-// uint8_t r_base = 0, g_base = 255, b_base = 200;
-
-for (int frame = 0; frame < 200; frame = frame +4) {
-    // 1. Wir zeichnen ALLES in den back_buffer (unsichtbar)
-    memset(back_buffer, 0, 1152000); 
-
-    float zoom = powf(3.0f, (float)frame / 300.0f);
-    float currentSize = 480.0f * zoom;
-    float startX = 240.0f - (currentSize / 2.0f);
-    float startY = 400.0f - (currentSize / 2.0f);
-
-    std::function<void(float, float, float, int)> drawLoop = 
-        [&](float x, float y, float size, int depth) {
-        if (depth == 0 || size < 1.0f) return;
-        float newSize = size / 3.0f;
-        
-        if (x + size > 0 && x < 480 && y + size > 0 && y < 800) {
-            int rx = (int)(x + newSize);
-            int ry = (int)(y + newSize);
-            int rw = (int)newSize;
-            int rh = (int)newSize;
-            
-            uint8_t r = r_base >> (6 - depth);
-            uint8_t g = g_base >> (6 - depth);
-            uint8_t b = b_base >> (6 - depth);
-
-            for (int i = ry; i < ry + rh; i++) {
-                if (i < 0 || i >= 800) continue;
-                int rowOffset = i * 480 * 3;
-                for (int j = rx; j < rx + rw; j++) {
-                    if (j < 0 || j >= 480) continue;
-                    int idx = rowOffset + (j * 3);
-                    // Wir schreiben in den BACK_BUFFER!
-                    back_buffer[idx] = r;
-                    back_buffer[idx + 1] = g;
-                    back_buffer[idx + 2] = b;
-                }
-            }
-
-            for (int i = 0; i < 3; i++) {
-                for (int j = 0; j < 3; j++) {
-                    if (i == 1 && j == 1) continue; 
-                    drawLoop(x + i * newSize, y + j * newSize, newSize, depth - 1);
-                }
-            }
-        }
-    };
-
-    drawLoop(startX, startY, currentSize, 6);
-
-    // 2. JETZT kopieren wir den fertigen Frame blitzschnell in den Display-FB
-    // Der P4 nutzt hier intern Optimierungen für PSRAM-Kopien
-    memcpy(display_fb, back_buffer, 1152000);
-
-    // 3. Cache synchronisieren
-    lcd.pushCache();
-    
-    vTaskDelay(pdMS_TO_TICKS(16)); 
-}
-
-
-// --- TEIL 8: Zeitgesteuerter Amiga Boing Ball ---
-ESP_LOGI(TAG, "Starte Amiga Ball Demo...");
-showC64Intro("AMIGA BALL", "realtime\nWITH\ndoublebuffer\n");
-
-// uint8_t* display_fb = (uint8_t*)lcd.framebuffer;
-float angle = 0;
-float ballX = 240, ballY = 400;
-float velX = 15.6f, velY =11.4f; // Etwas flotter für 2 Sekunden
-
-// Startzeit in Mikrosekunden holen
-int64_t startTime = esp_timer_get_time();
-
-// Läuft exakt 2.000.000 Mikrosekunden
-while ((esp_timer_get_time() - startTime) < 8000000) {
-    memset(back_buffer, 0, 1152000);
-
-    // Physik
-    ballX += velX;
-    ballY += velY;
-    if (ballX < 60 || ballX > 420) velX = -velX;
-    if (ballY < 60 || ballY > 740) velY = -velY;
-
-    angle += 0.2f; 
-    const int radius = 60;
-
-    for (int py = -radius; py < radius; py++) {
-        float dx = sqrtf(radius * radius - py * py);
-        int screenY = (int)(ballY + py);
-        if (screenY < 0 || screenY >= 800) continue;
-
-        int rowOffset = screenY * 480 * 3;
-
-        for (int px = (int)-dx; px < (int)dx; px++) {
-            int screenX = (int)(ballX + px);
-            if (screenX < 0 || screenX >= 480) continue;
-
-            // Die Projektion
-            float longitude = asinf(px / dx) + angle;
-            float latitude = acosf(py / (float)radius);
-            
-            // Checkerboard
-            bool check = ((int)(longitude * 4 / M_PI) % 2 == 0) ^ ((int)(latitude * 8 / M_PI) % 2 == 0);
-            
-            int idx = rowOffset + (screenX * 3);
-            if (check) {
-                back_buffer[idx] = 255; back_buffer[idx+1] = 0; back_buffer[idx+2] = 0;
-            } else {
-                back_buffer[idx] = 255; back_buffer[idx+1] = 255; back_buffer[idx+2] = 255;
-            }
-        }
+        // Neuer Zufalls-TopBanner & Animation fuer die naechste Runde zuruecksetzen
+        banner_idx = esp_random() % 4;
+        anim_frame = 0;
+        UIintervalTimerFlag = (uint32_t)(esp_timer_get_time() / 1000);
+      }
     }
 
-    memcpy(display_fb, back_buffer, 1152000);
-    lcd.pushCache();
-    
-    // Kurze Pause um die CPU nicht zu 100% zu grillen
-    vTaskDelay(pdMS_TO_TICKS(8)); 
-}
-
-ESP_LOGI(TAG, "Boing Ball Demo beendet.");
-
-
-/// next effekt
-// --- TEIL 10: Der organische Plasma-Wormhole ---
-showC64Intro("PLASMA", "Realtime calculated\nWORMHOLE\nAlpha Blending\nWITH\ndoublebuffer\n");
-ESP_LOGI(TAG, "Starte Wormhole-Animation...");
-
-// uint8_t* display_fb = (uint8_t*)lcd.framebuffer;
-int64_t wormStart = esp_timer_get_time();
-float elapsed = 0;
-
-while ((esp_timer_get_time() - wormStart) < 20000000) {
-    elapsed += 0.04f;
-
-    // Driften des Mittelpunkts (Lissajous-Kurve)
-    float centerX = 240.0f + sinf(elapsed * 0.7f) * 80.0f;
-    float centerY = 400.0f + cosf(elapsed * 0.5f) * 120.0f;
-
-    // Wir nutzen den back_buffer für das aktuelle Rendering
-    for (int y = 0; y < 800; y += 2) { 
-        float dy = (y - centerY);
-        int rowIdx = y * 480 * 3;
-
-        for (int x = 0; x < 480; x += 2) {
-            float dx = (x - centerX);
-
-            // Polar-Koordinaten berechnen
-            float dist = sqrtf(dx * dx + dy * dy);
-            if (dist < 1.0f) dist = 1.0f;
-            float angle = atan2f(dy, dx);
-
-            // Tunnel-Textur-Logik (Z-Tiefe + Rotation)
-            // Die Tiefe wird durch 1/distanz erzeugt
-            float z = (4000.0f / dist) + (elapsed * 30.0f);
-            float a = (angle * 3.0f / M_PI) + (elapsed * 0.5f);
-
-            // Erzeuge ein Plasma-Muster basierend auf Z und A
-            uint8_t pattern = (uint8_t)((sinf(z * 0.2f) + sinf(a * 5.0f)) * 127 + 128);
-            
-            // "Neblige" Farbmischung (Neon-Blue & Purple)
-            uint8_t r = pattern / 4;
-            uint8_t g = pattern / 8;
-            uint8_t b = pattern;
-
-            // Zeichne 2x2 Pixel-Blöcke
-            for (int yy = 0; yy < 2; yy++) {
-                int py = y + yy;
-                if (py >= 800) continue;
-                for (int xx = 0; xx < 2; xx++) {
-                    int px = x + xx;
-                    if (px >= 480) continue;
-                    
-                    int idx = (py * 480 + px) * 3;
-
-                    // --- HALBTRANSPARENZ (Alpha Blending) ---
-                    // Wir mischen den neuen Pixel (50%) mit dem alten (50%)
-                    back_buffer[idx]   = (back_buffer[idx]   + r) >> 1;
-                    back_buffer[idx+1] = (back_buffer[idx+1] + g) >> 1;
-                    back_buffer[idx+2] = (back_buffer[idx+2] + b) >> 1;
-                }
-            }
-        }
-    }
-
-    // Den fertigen Frame in den echten Framebuffer schieben
-    memcpy(display_fb, back_buffer, 1152000);
-    lcd.pushCache();
-    vTaskDelay(pdMS_TO_TICKS(5)); 
-}
-
-
-}
-
+    // Kurzer Task-Yield für FreeRTOS IDLE-Task & Watchdog
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
 }

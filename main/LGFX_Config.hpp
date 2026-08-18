@@ -14,9 +14,7 @@
 #include "esp_littlefs.h"
 #include "esp_vfs.h"
 #include "esp_log.h"
-
-
-
+#include <dirent.h>
 
 class LGFX_ST7701_P4 : public lgfx::LGFX_Device {
     lgfx::Panel_Device* _panel_instance = nullptr;
@@ -135,12 +133,11 @@ public:
     bool initFS() {
         ESP_LOGI("LGFX_FS", "Mounte 9MB LittleFS Partition...");
 
-        esp_vfs_littlefs_conf_t conf = {
-            .base_path = "/littlefs",
-            .partition_label = "storage", 
-            .format_if_mount_failed = true,
-            .dont_mount = false
-        };
+        esp_vfs_littlefs_conf_t conf = {};
+        conf.base_path = "/littlefs";
+        conf.partition_label = "storage"; 
+        conf.format_if_mount_failed = true;
+        conf.dont_mount = false;
 
         esp_err_t ret = esp_vfs_littlefs_register(&conf);
 
@@ -155,7 +152,25 @@ public:
 
         size_t total = 0, used = 0;
         esp_littlefs_info(conf.partition_label, &total, &used);
-        ESP_LOGI("LGFX_FS", "Partition Kapazität: %d KB, Belegt: %d KB", total / 1024, used / 1024);
+        ESP_LOGI("LGFX_FS", "Partition Kapazität: %d KB, Belegt: %d KB", (int)(total / 1024), (int)(used / 1024));
+
+        DIR *dir = opendir("/littlefs");
+        if (dir) {
+            ESP_LOGI("LGFX_FS", "Inhalt von /littlefs:");
+            struct dirent *de;
+            int count = 0;
+            while ((de = readdir(dir)) != NULL) {
+                ESP_LOGI("LGFX_FS", "  - %s", de->d_name);
+                count++;
+            }
+            closedir(dir);
+            if (count == 0) {
+                ESP_LOGW("LGFX_FS", "WARNUNG: LittleFS ist leer! storage.bin wurde vermutlich noch nicht geflasht.");
+            }
+        } else {
+            ESP_LOGE("LGFX_FS", "Konnte /littlefs Verzeichnis nicht öffnen!");
+        }
+
         return true;
     }
 
